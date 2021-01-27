@@ -58,20 +58,21 @@ namespace upywrap
     using native_obj_t = T*;
 #endif
 
+    //Initialize the type and store it the module's globals dict so it's accessible as <mod>.<name>.
     ClassWrapper( const char* name, mp_obj_module_t* mod, decltype( mp_obj_type_t::flags ) flags = 0 ) :
       ClassWrapper( name, mod->globals, flags )
     {
     }
 
-    ClassWrapper( const char* name, mp_obj_dict_t* dict, decltype( mp_obj_type_t::flags ) flags = 0 )
+    //Initialize the type and store it in the given dict, normally a module's globals dict.
+    //Stores the type with the given name, but also stores the type's locals dict: assuming the
+    //given dict is allocated on the MicroPython heap this makes our members reachable by the GC
+    //mark phase, or in other words: crucial to prevent the GC from sweeping it.
+    ClassWrapper( const char* name, mp_obj_dict_t* dict, decltype( mp_obj_type_t::flags ) flags = 0 ) :
+      ClassWrapper( name, flags )
     {
-      static bool init = false;
-      if( !init )
-      {
-        OneTimeInit( name, dict );
-        type.flags |= flags;
-        init = true;
-      }
+      mp_obj_dict_store( dict, new_qstr( name ), &type );
+      mp_obj_dict_store( dict, new_qstr( ( std::string( name ) + "_locals" ).data() ), MP_OBJ_FROM_PTR( type.locals_dict ) );
     }
 
     const mp_obj_type_t& Type() const
@@ -342,6 +343,25 @@ namespace upywrap
 #endif
 
   private:
+    ClassWrapper( const char* name, decltype( mp_obj_type_t::flags ) flags )
+    {
+      //Initialize the static parts; note this will set the type's name,
+      //and while it's allowed to call the constructor again with a different name,
+      //the type will still have the original name. Flags must be the same though,
+      //since they tield a type which is actually different.
+      static bool init = false;
+      if( !init )
+      {
+        OneTimeInit( name );
+        type.flags = flags;
+        init = true;
+      }
+      else if( type.flags != flags )
+      {
+        throw std::runtime_error( "ClassWrapper's type flags can only be set once" );
+      }
+    }
+
     struct FixedFuncNames
     {
       func_name_def( Init )
@@ -520,11 +540,10 @@ namespace upywrap
       return ToPyObj< void >::Convert();
     }
 
-    void OneTimeInit( std::string name, mp_obj_dict_t* dict )
+    void OneTimeInit( const char* name )
     {
-      const auto qname = qstr_from_str( name.data() );
       type.base.type = &mp_type_type;
-      type.name = static_cast< decltype( type.name ) >( qname );
+      type.name = static_cast< decltype( type.name ) >( qstr_from_str( name ) );
       type.locals_dict = (mp_obj_dict_t*) mp_obj_new_dict( 0 );
       type.make_new = nullptr;
       type.attr = attr;
@@ -532,11 +551,6 @@ namespace upywrap
       type.unary_op = mp_generic_unary_op;
       type.print = instance_print;
       type.call = instance_call;
-
-      mp_obj_dict_store( dict, new_qstr( qname ), &type );
-      //store our dict in the module's dict so it's reachable by the GC mark phase,
-      //or in other words: prevent the GC from sweeping it!!
-      mp_obj_dict_store( dict, new_qstr( ( name + "_locals" ).data() ), type.locals_dict );
 
       AddFunctionToTable( MP_QSTR___del__, MakeFunction( del ) );
       auto caster = m_new_obj( mp_rom_obj_static_class_method_t );
